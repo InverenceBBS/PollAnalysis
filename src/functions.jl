@@ -1,3 +1,6 @@
+using Chain
+using DataFrames, DataFramesMeta
+
 function plotResults(party, Opinions, NationalResults, LocalResults)
     OpinionsParty, NationalResultsParty, LocalResultsParty = extract_party_data(party,Opinions, NationalResults, LocalResults)
 

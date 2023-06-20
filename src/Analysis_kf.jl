@@ -87,7 +87,13 @@ for this_party in unique(Opinions.name)
     @show this_party
     this_party_Opinions, this_party_NationalResults, _ = extract_party_data(this_party,Opinions, NationalResults, LocalResults)
     this_x₀ = nrow(this_party_NationalResults) == 0 ? this_party_Opinions.value[1] : this_party_NationalResults.value[1]
+   
+    # all the magic happens here, where we apply the Kalman filtering.
+    # default parameters are as follows:
+    # P0=.5, Φ=1., b=.0, Q=.5, H=1., R=5.
+    # Q and R are the knobs that determine the "smoothing" profile
     this_party_ps, this_party_ys = kalman_fit(this_x₀,this_party_Opinions.value)
+   
     this_party_plot = plot_kf(this_party_ps, this_party_ys, uppercase(this_party) * " observed", this_party_Opinions.date)
    
     results_post_polls = @subset(this_party_NationalResults, :date .!= Date("2000-03-12"))

@@ -59,9 +59,20 @@ Opinions = @subset(Opinions, .!ismissing.(:value))
 Opinions = groupby(Opinions, [:date, :name]);
 Opinions = @combine(Opinions, :value = mean(:value))
 
-# Multi-party analysis
+# Mono-party analysis
 
-# With differential equations
+## Plot Trends
+
+for this_party in unique(Opinions.name)
+    @show this_party
+    plt = plotResults(this_party, Opinions, NationalResults, LocalResults)
+    savefig(plt, "./Plots/Trends/"*this_party*"_trends.png")
+end
+
+# Filter data with a local linear trend
+# yₜ   = μₜ + γₜ + εₜ with εₜ ∼ N(0,σ²ₑ)
+# μₜ₊₁ = μₜ + νₜ + ξₜ with ξₜ ∼ N(0,σₔ)
+# νₜ₊₁ = νₜ + ζₜ      with ζₜ ∼ N(0,σ²ₛ)
 
 K = 20
 
@@ -73,6 +84,29 @@ accuracies = DataFrame(
     Prevision = fill(Float64,0),
     Error = fill(Float64,0)
 )
+
+this_party = "pp"
+ppthis_party_Opinions, ppnr, _ = extract_party_data(this_party,Opinions, NationalResults, LocalResults)   
+
+ppthis_model = LocalLinearTrend(ppthis_party_Opinions.value)
+fit!(ppthis_model)
+ppthis_filt = kalman_filter(ppthis_model)
+
+ppthis_filt_states = get_filtered_state(ppthis_filt)[:,1]
+
+this_party = "psoe"
+psoethis_party_Opinions, psoenr, _ = extract_party_data(this_party,Opinions, NationalResults, LocalResults)   
+
+psoethis_model = LocalLinearTrend(psoethis_party_Opinions.value)
+fit!(psoethis_model)
+psoethis_filt = kalman_filter(psoethis_model)
+
+psoethis_filt_states = get_filtered_state(psoethis_filt)[:,1]
+
+plot(psoethis_party_Opinions.date,psoethis_filt_states, label = "psoe")
+plot!(ppthis_party_Opinions.date,ppthis_filt_states, label = "pp")
+scatter!(ppnr.date,ppnr.value)
+scatter!(psoenr.date,psoenr.value)
 
 for this_party in unique(Opinions.name)
     @show this_party

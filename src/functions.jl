@@ -1,4 +1,3 @@
-using Chain
 using DataFrames, DataFramesMeta
 
 function plotResults(party, Opinions, NationalResults, LocalResults)
@@ -14,12 +13,10 @@ function plotResults(party, Opinions, NationalResults, LocalResults)
 end
 
 function unify_results(party,ResDf)
-    Res = @chain ResDf begin
-        @subset(:name .== party)
-        sort!(:date)
-        @select(:date,:Firm,:name,:value)
-        unique!
-        end
+    Res = @subset(ResDf,:name .== party)
+    sort!(Res,:date)
+    @select!(Res,:date,:Firm,:name,:value)
+    unique!(Res)
     return(Res)
 end
 

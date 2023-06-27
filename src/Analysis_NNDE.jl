@@ -4,183 +4,141 @@ Pkg.instantiate()
 
 using Revise
 
-include("./functions.jl")
-
-
-using Chain
-using CSV
 using DataFrames, DataFramesMeta
-using Glob
-using LinearAlgebra, Statistics
-using StateSpaceModels
-using Plots
 using Dates
 
-# Read in data
+include("./functions.jl")
+include("./99_read_in_data.jl")
 
-Folder = "./Data/Raw"  
-Files = glob("*.csv", Folder) 
+using OrdinaryDiffEq, ModelingToolkit, DataDrivenDiffEq, SciMLSensitivity, DataDrivenSparse
+using Optimization, OptimizationOptimisers, OptimizationOptimJL
 
-Polls = DataFrame.(CSV.File.(Files,
-        missingstring=["NA", "NAN", "NULL"],
-        types=Dict(:value=>Float64)))
+# Standard Libraries
+using LinearAlgebra, Statistics
 
-for i in 1:length(Polls)
-    if "Lead" ∉ names(Polls[i])
-        Polls[i][!,:Lead] .= missing
-    end    
+# External Libraries
+using StaticArrays, ComponentArrays, Lux, Zygote, Plots, StableRNGs
+
+rng = StableRNG(42)
+
+# We propose first a bipartitic model of the form
+# dXₜ   = NNₛ(Xₜ₋₁)dt
+# where Xₜ  = [psoeₜ₋₁;ppₜ₋₁;...]
+
+## We first prepare the data for eight parties
+## we extract it from the processed data
+## Join it all, matchin dates
+parties = ["pp","psoe","vox","upd","ip","cs","up","sum","upo"]
+
+just_party_data(party_name) = select.(extract_party_data(party_name,Opinions, NationalResults, LocalResults),:date,:value)
+
+op_data, nr_data, lr_data = just_party_data(parties[1])
+
+for party in parties[2:end]
+    party_data_op, party_data_nr, party_data_lr = just_party_data(party)
+    op_data = leftjoin(op_data,party_data_op,
+                       on = :date, makeunique=true, renamecols = "" => party)
+    nr_data = leftjoin(nr_data,party_data_nr,
+                       on = :date, makeunique=true, renamecols = "" => party)
+    lr_data = leftjoin(lr_data,party_data_lr,
+                       on = :date, makeunique=true, renamecols = "" => party)
+end
+
+op_data = sort!(coalesce.(op_data, 0.),:date)
+nr_data = sort!(coalesce.(nr_data, 0.),:date)
+lr_data = sort!(coalesce.(lr_data, 0.),:date)
+
+
+op_data.valueuposum = op_data.valuesum .+ op_data.valueupo
+select!(op_data, Not([:valuesum, :valueupo]))
+
+nr_data.valueuposum = nr_data.valuesum .+ nr_data.valueupo
+select!(nr_data, Not([:valuesum, :valueupo]))
+
+lr_data.valueuposum = lr_data.valuesum .+ lr_data.valueupo
+select!(lr_data, Not([:valuesum, :valueupo]))
+
+## We transform the data into matrices as we like them
+## each column is a time step, each row a variable
+Xₙ = Matrix(op_data[:,2:end])' |> collect
+NR = Matrix(nr_data[:,2:end])' |> collect
+U₀ = NR[:,1]
+
+tspan = maximum(op_data.date) - minimum(op_data.date) |> Dates.value
+t = (op_data.date |> sort |> unique) .- minimum(op_data.date) .|> Dates.value
+t /= tspan
+tspan = (0.0, 1.0)
+
+rbf(x) = exp.(-(x .^ 2))
+
+
+
+const NN = Lux.Chain(
+        Lux.Dense(8, 12, rbf),
+        Lux.Dense(12, 12, rbf),
+        Lux.Dense(12, 13, rbf))
+# Get the initial parameters and state variables of the model
+p, st = Lux.setup(rng, NN)
+
+function nn_dynamics!(du, u, p, t)
+    û = NN(u, p, st)[1] # Network prediction
+    du[1] = u[1]*û[1] - u[2]*û[9] - sum(u[3:end])*û[1]
+    du[2] = u[2]*û[2] - u[1]*û[10] - sum(u[3:end])*û[1]
+    du[3:end] .= u[3:end] .* û[3:8]
+end
+
+# Define the problem
+prob_nn = ODEProblem(nn_dynamics!, U₀, tspan, p)
+
+## prediction and loss functions
+function predict(θ, X = U₀, T = t)
+    _prob = remake(prob_nn, u0 = X, tspan = (T[1], T[end]), p = θ)
+    Array(solve(_prob, Vern7(), saveat = T,
+                abstol = 1e-6, reltol = 1e-6,
+                sensealg = QuadratureAdjoint(autojacvec=ReverseDiffVJP(true))))
+end
+
+function loss(θ)
+    X̂ = predict(θ)
+    mean(abs2, Xₙ .- X̂) #+ 0.8 * mean(abs2, NationalResults .- X̂) # Here's where we can add a penalisation based on National (and whatever else) results
+end
+
+losses = Float64[]
+
+callback = function (p, l)
+    push!(losses, l)
+    if length(losses) % 50 == 0
+        println("Current loss after $(length(losses)) iterations: $(losses[end])")
+     
+        X̂ = predict(p, U₀, t)
+        # Trained on noisy data vs observations
+        plotto = scatter(t, transpose(Xₙ[1:2,:]), color = [:orange :lightblue ], label = ["Measurements" nothing], alpha = 0.2)
+        plot!(plotto, t, transpose(X̂[1:2,:]), xlabel = "t", ylabel = "Sustain %", color = [:red :blue],
+                         label = ["PSOE" "PP"])
+        display(plotto)
+    end
+    return false
 end
 
 
-Polls = reduce(vcat,Polls)
+## TRAINING
 
-## Prepare data for analysis
+adtype = Optimization.AutoZygote()
+optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
+optprob = Optimization.OptimizationProblem(optf, ComponentVector{Float64}(p))
 
-Results = Polls[occursin.(r"election", Polls.Firm), :]
-Results = @subset(Results, .!ismissing.(:date))
-Results = @subset(Results, .!ismissing.(:value))
+res1 = Optimization.solve(optprob, ADAM(), callback = callback, maxiters = 5000)
+println("Training loss after $(length(losses)) iterations: $(losses[end])")
 
+optprob2 = Optimization.OptimizationProblem(optf, res1.u)
+res2 = Optimization.solve(optprob2, Optim.LBFGS(), callback = callback, maxiters = 1000)
+println("Final training loss after $(length(losses)) iterations: $(losses[end])")
 
-LocalResults = Results[occursin.(r"local", Results.Firm), :]
+# Rename the best candidate
+p_trained = res2.u
 
-#### To be fixed: general election results appear twice
-#### once as outcome of the current election table
-#### once as outcome of the previous elections. 
-
-NationalResults = Results[occursin.(r"general", Results.Firm), :]
-EuropeanParliament = Results[occursin.(r"epe", Results.Firm), :]
-
-Opinions = Polls[.!occursin.(r"election", Polls.Firm), :]
-Opinions = @subset(Opinions, .!ismissing.(:date))
-Opinions = @subset(Opinions, .!ismissing.(:value))
-
-
-### Here we could use a weighting system to improve the averaging
-Opinions = groupby(Opinions, [:date, :name]);
-Opinions = @combine(Opinions, :value = mean(:value))
-
-# Mono-party analysis
-
-## Plot Trends
-
-for this_party in unique(Opinions.name)
-    @show this_party
-    plt = plotResults(this_party, Opinions, NationalResults, LocalResults)
-    savefig(plt, "./Plots/Trends/"*this_party*"_trends.png")
-end
-
-# Filter data with a local linear trend
-# yₜ   = μₜ + γₜ + εₜ with εₜ ∼ N(0,σ²ₑ)
-# μₜ₊₁ = μₜ + νₜ + ξₜ with ξₜ ∼ N(0,σₔ)
-# νₜ₊₁ = νₜ + ζₜ      with ζₜ ∼ N(0,σ²ₛ)
-
-K = 20
-
-accuracies = DataFrame(
-    ElectionDate = fill(Date,0),
-    PrevisionDate = fill(Date,0),
-    Party = fill(String,0),
-    Result = fill(Float64,0),
-    Prevision = fill(Float64,0),
-    Error = fill(Float64,0)
-)
-
-this_party = "pp"
-ppthis_party_Opinions, ppnr, _ = extract_party_data(this_party,Opinions, NationalResults, LocalResults)   
-
-ppthis_model = LocalLinearTrend(ppthis_party_Opinions.value)
-fit!(ppthis_model)
-ppthis_filt = kalman_filter(ppthis_model)
-
-ppthis_filt_states = get_filtered_state(ppthis_filt)[:,1]
-
-this_party = "psoe"
-psoethis_party_Opinions, psoenr, _ = extract_party_data(this_party,Opinions, NationalResults, LocalResults)   
-
-psoethis_model = LocalLinearTrend(psoethis_party_Opinions.value)
-fit!(psoethis_model)
-psoethis_filt = kalman_filter(psoethis_model)
-
-psoethis_filt_states = get_filtered_state(psoethis_filt)[:,1]
-
-plot(psoethis_party_Opinions.date,psoethis_filt_states, label = "psoe")
-plot!(ppthis_party_Opinions.date,ppthis_filt_states, label = "pp")
-scatter!(ppnr.date,ppnr.value)
-scatter!(psoenr.date,psoenr.value)
-
-for this_party in unique(Opinions.name)
-    @show this_party
-    this_party_Opinions, this_party_NationalResults, _ = extract_party_data(this_party,Opinions, NationalResults, LocalResults)   
-    # all the magic happens here, where we apply a local linear trend state space model
-    this_model = LocalLinearTrend(this_party_Opinions.value)
-    fit!(this_model)
-    this_filt = kalman_filter(this_model)
-
-    this_filt_states = get_filtered_state(this_filt)[:,1]
-
-
-    this_prev = forecast(this_model, 30)
-
-
-    this_Plot = plot(this_model, this_prev, label=["observed" "prevision"])
-    plot!(this_Plot, this_filt_states, label="Filtered")
-   
-    results_post_polls = @subset(this_party_NationalResults, :date .!= Date("2000-03-12"))
-
-    
-    if !(nrow(results_post_polls) == 0)
-    
-    rez_plot = plot(this_party_Opinions.date, this_filt_states, label="filtered")
-    scatter!(rez_plot, this_party_NationalResults.date, this_party_NationalResults.value, color="green", label="National")
-    savefig(rez_plot, "./Plots/LocalLinearFilter/"*this_party*"_filter_vs_rez.png")
-
-    for election in eachrow(results_post_polls)
-        
-        k = minimum([count(this_party_Opinions.date .< election.date),K])
-
-        if k > 0
-
-        prevision_dates = find_previous_date(election.date, this_party_Opinions.date,k)
-        
-        Previsions = @subset DataFrame(date = this_party_Opinions.date, value = this_filt_states) @byrow begin
-            :date ∈ prevision_dates
-        end
-    
-        this_sse = [abs(prevision.value .- election.value) for prevision in eachrow(Previsions)]
-    
-        L = length(this_sse)  # Original length
-            
-        # Check that K is greater than L
-        if k > L
-            # Create a vector of zeros of the necessary length
-            zero_padding = fill(missing,k - L)
-            # Prepend the zeros to the original vector
-            this_sse = vcat(zero_padding, this_sse)
-        end
-
-        this_accuracies = DataFrame(
-            ElectionDate = fill(election.date,k),
-            PrevisionDate = prevision_dates,
-            Party = fill(this_party,k),
-            Result = fill(election.value,k),
-            Prevision = Previsions.value,
-            Error = this_sse
-            )
-
-        global accuracies
-        accuracies = vcat(accuracies,this_accuracies)
-    end
-    
-    end
-
-    end
-
-    savefig(this_Plot, "./Plots/LocalLinearFilter/"*this_party*"_filter.png")
-end
-
-
-accuracies
-
-CSV.write("./Data/Outputs/LocalLinearTrend_electoral_prediction_accuracy_by_party.csv",
-accuracies
-)
+X̂ = predict(p_trained, U₀, t)
+# Trained on noisy data vs real solution
+scatter(t, transpose(Xₙ[[1,8],:]), color = [:orange :lightblue ], label = ["Measurements" nothing], alpha = 0.2)
+plot!(t, transpose(X̂[7:8,:]), xlabel = "t", ylabel = "Sustain %", color = [:red :blue],
+                     label = ["PP" "PSOE"])
